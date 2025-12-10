@@ -35,6 +35,182 @@ from pycel.lib.function_helpers import load_functions
 from pycel.lib.function_info import func_status_msg
 
 
+def _flatten_iter(values):
+    """Flatten nested lists/tuples from range arguments into a 1D iterator."""
+    for v in values:
+        if isinstance(v, (list, tuple)):
+            for x in _flatten_iter(v):
+                yield x
+        else:
+            yield v
+
+
+def irr(values, guess=0.1, max_iterations=100, tolerance=1e-7):
+    """
+    Approximate Excel's IRR for periodic cashflows using a safe bisection method.
+
+    - `values` is typically a 1D or nested list from a range like E40:K40
+    - `guess` is accepted for API compatibility but only used to help choose an
+      initial upper bound; the core algorithm is bracket + bisection.
+    - Returns a float rate, or '#NUM!' on failure (Excel-style).
+    """
+
+    # Flatten & coerce values to a list of numbers
+    cashflows = [
+        coerce_to_number(v) for v in _flatten_iter(values)
+        if v not in (None, EMPTY)
+    ]
+
+    # Need at least one positive and one negative cashflow
+    if not cashflows or not any(c > 0 for c in cashflows) or not any(c < 0 for c in cashflows):
+        return '#NUM!'
+
+    # Safe NPV computation that avoids overflow/underflow
+    def npv(rate):
+        one_plus_r = 1.0 + rate
+        # Invalid region: Excel's IRR won't accept r <= -1
+        if one_plus_r <= 0.0:
+            # Return a very large magnitude with the sign of the first non-zero CF
+            first = next((c for c in cashflows if c != 0), 0.0)
+            return float('inf') if first > 0 else -float('inf')
+
+        log1p_r = math.log1p(rate)
+        max_log = 700.0  # ~exp(700) is near double precision overflow
+
+        total = 0.0
+        for t, c in enumerate(cashflows):
+            if t == 0:
+                total += c
+                continue
+
+            exp_arg = t * log1p_r
+            # Clamp exponent to avoid overflow/underflow
+            if exp_arg > max_log:
+                disc = float('inf')
+            elif exp_arg < -max_log:
+                disc = math.exp(-max_log)
+            else:
+                disc = math.exp(exp_arg)
+
+            if disc == 0.0:
+                # extreme discounting; contribution is effectively zero
+                continue
+            total += c / disc
+
+        return total
+
+    # --- Bracket search ------------------------------------------------------
+    # Start with a fairly wide bracket; Excel IRRs are rarely extreme.
+    low = -0.9999
+    high = max(guess, 0.1)
+
+    npv_low = npv(low)
+    npv_high = npv(high)
+
+    # If initial bracket doesn't have a sign change, expand the upper bound
+    expansions = 0
+    while npv_low * npv_high > 0 and expansions < 10:
+        high = high * 2.0 + 1.0  # grow roughly exponentially
+        if high > 1e6:
+            break
+        npv_high = npv(high)
+        expansions += 1
+
+    # If still no sign change, give up like Excel with #NUM!
+    if npv_low == 0.0:
+        return low
+    if npv_high == 0.0:
+        return high
+    if npv_low * npv_high > 0:
+        return '#NUM!'
+
+    # --- Bisection -----------------------------------------------------------
+    for _ in range(max_iterations):
+        mid = 0.5 * (low + high)
+        npv_mid = npv(mid)
+
+        if abs(npv_mid) < tolerance:
+            return mid
+
+        # Decide which side to keep
+        if npv_low * npv_mid < 0:
+            high = mid
+            npv_high = npv_mid
+        else:
+            low = mid
+            npv_low = npv_mid
+
+    # If we didn't converge, return Excel-like error
+    return '#NUM!'
+
+
+def _to_list(arg):
+    """Normalize a scalar or nested iterable into a flat list."""
+    if isinstance(arg, (list, tuple)):
+        return list(_flatten_iter(arg))
+    return [arg]
+
+
+def xlookup(lookup_value,
+            lookup_array,
+            return_array,
+            if_not_found=None,
+            match_mode=0,
+            search_mode=1):
+    """
+    Simplified XLOOKUP implementation, matching Excel semantics 'within reason'.
+
+    Parameters match Excel:
+        XLOOKUP(lookup_value, lookup_array, return_array,
+                [if_not_found], [match_mode], [search_mode])
+
+    Implemented behavior:
+    - Exact match (match_mode == 0) only.
+    - search_mode == 1 (first-to-last) and -1 (last-to-first).
+    - if_not_found:
+        * if provided, returned when nothing is found
+        * otherwise '#N/A'
+
+    Unsupported (will behave like exact search or ignore flag):
+    - match_mode -1, 1, 2 (approx / wildcard)
+    - search_mode 2, -2 (binary search)
+    """
+
+    # Normalize arrays to flat lists
+    lookup_list = _to_list(lookup_array)
+    return_list = _to_list(return_array)
+
+    # Coerce lengths
+    n = min(len(lookup_list), len(return_list))
+    lookup_list = lookup_list[:n]
+    return_list = return_list[:n]
+
+    # Default not-found value matches Excel's #N/A
+    na_value = '#N/A'
+    not_found = na_value if if_not_found is None else if_not_found
+
+    # Only implement exact match (match_mode == 0) for now
+    # Other match modes fall back to exact search semantics.
+    def values_equal(a, b):
+        # Basic Excel-like comparison: treat None/EMPTY as unequal to everything
+        if a in (None, EMPTY) or b in (None, EMPTY):
+            return False
+        return a == b
+
+    # Decide iteration order based on search_mode
+    if search_mode == -1:
+        indices = range(n - 1, -1, -1)  # last-to-first
+    else:
+        indices = range(n)              # first-to-last (default)
+
+    for i in indices:
+        if values_equal(lookup_list[i], lookup_value):
+            return return_list[i]
+
+    return not_found
+
+
+
 ADDR_FUNCS_NAMES = '_R_', '_C_', '_REF_'
 
 
@@ -886,6 +1062,9 @@ class ExcelFormula:
             name_space['_R_'] = evaluate_range
             name_space['_REF_'] = AddressRange.create
             name_space['pi'] = math.pi
+            # make custom functions available to compiled formulas
+            name_space['irr'] = irr
+            name_space['xlookup'] = xlookup
 
             # function to fixup the operands
             name_space['excel_operator_operand_fixup'] = \
