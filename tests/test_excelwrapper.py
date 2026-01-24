@@ -13,6 +13,7 @@ from pycel.excelutil import AddressRange
 from pycel.excelwrapper import (
     _OpxRange,
     ARRAY_FORMULA_FORMAT,
+    ExcelOpxWrapper,
     ExcelOpxWrapperNoData,
 )
 
@@ -125,6 +126,67 @@ def test_get_defined_names(excel):
     assert expected == excel.defined_names
 
     assert excel.defined_names == excel.defined_names
+
+
+def test_defined_names_bri_manus_blend_portfolio():
+    """Test that defined names can be discovered from BRI-Manus Blend Portfolio Model.
+    
+    This is a positive control test using a real-world Excel workbook to verify
+    that the ExcelWrapper.defined_names property correctly discovers named ranges.
+    """
+    import os
+    from unittest import mock
+    import openpyxl.worksheet._reader as orw
+    
+    xlsx_path = '/data/mbiggs/platform/motsuki_sa/artifacts/BRI-Manus_Blend_Portfolio_Model_December 2025.xlsx'
+    
+    # Skip if the file doesn't exist (e.g., running tests in CI without the file)
+    if not os.path.exists(xlsx_path):
+        pytest.skip(f"Test file not found: {xlsx_path}")
+    
+    old_warn = orw.warn
+
+    def new_warn(msg, *args, **kwargs):
+        if 'Unknown' not in msg:
+            old_warn(msg, *args, **kwargs)
+
+    # quiet the warnings about unknown extensions
+    with mock.patch('openpyxl.worksheet._reader.warn', new_warn):
+        excel_wrapper = ExcelOpxWrapper(xlsx_path)
+        excel_wrapper.load()
+    
+    # Verify that defined_names is populated
+    defined_names = excel_wrapper.defined_names
+    assert defined_names is not None, "defined_names should not be None"
+    assert isinstance(defined_names, dict), "defined_names should be a dict"
+    
+    # Test the specific named range: PARAM.z9_c14_fermyield_2027
+    # Note: The original Excel reference is "'Z9-C14 Tolling (New)'!$E$19"
+    # but openpyxl's destinations property strips the quotes from sheet names
+    expected_name = 'PARAM.z9_c14_fermyield_2027'
+    expected_reference = "$E$19"
+    expected_sheet = "Z9-C14 Tolling (New)"
+    
+    assert expected_name in defined_names, (
+        f"Expected defined name '{expected_name}' not found. "
+        f"Available names: {list(defined_names.keys())[:20]}..."  # Show first 20 for debugging
+    )
+    
+    # Check the reference matches
+    name_destinations = defined_names[expected_name]
+    assert len(name_destinations) >= 1, f"Expected at least one destination for '{expected_name}'"
+    
+    # Find the matching destination
+    found_match = False
+    for ref, sheet in name_destinations:
+        if ref == expected_reference and sheet == expected_sheet:
+            found_match = True
+            break
+    
+    assert found_match, (
+        f"Expected '{expected_name}' to refer to '{expected_sheet}!{expected_reference}', "
+        f"but got: {name_destinations}"
+    )
 
 
 def test_get_tables(excel):

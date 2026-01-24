@@ -169,7 +169,16 @@ class ExcelOpxWrapper(ExcelWrapper):
         if self.workbook is not None and self._defined_names is None:
             self._defined_names = {}
 
-            for d_name in self.workbook.defined_names.definedName:
+            # Support both old openpyxl API (definedName attribute) and
+            # new openpyxl 3.x API (dict-like DefinedNameDict)
+            if hasattr(self.workbook.defined_names, 'definedName'):
+                # Old openpyxl API
+                defined_name_iter = self.workbook.defined_names.definedName
+            else:
+                # New openpyxl 3.x API - defined_names is dict-like
+                defined_name_iter = self.workbook.defined_names.values()
+
+            for d_name in defined_name_iter:
                 destinations = [
                     (alias, wksht) for wksht, alias in d_name.destinations
                     if wksht in self.workbook]
